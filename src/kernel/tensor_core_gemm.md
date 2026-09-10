@@ -1,4 +1,4 @@
-# Tensor Core + Double Buffer + Warp Tiling
+# Tensor Core + Multi-stage Pipeline + Warp Tiling
 
 实现位于 `tensor_core_gemm.cuh`，延续 `tiling_gemm.cuh` 的行主序接口和参数顺序：
 
@@ -14,28 +14,27 @@ cudaError_t status = launch_tensor_core_gemm(A, B, C, M, K, N, stream);
 
 | 层级 | 大小 | 工作 |
 | --- | --- | --- |
-| Block tile | `BM=64, BN=64, BK=32` | 一个 block 负责 C 的 `64×64` 区域 |
-| Warp tile | `WM=32, WN=32` | 4 个 warp 按 `2×2` 排列，每个计算 `32×32` |
-| WMMA | `16×16×8` | 每个 warp 保存 `2×2` 个累加 fragment |
-| Shared memory | 36 KiB/block | 双份 A/B tile 共 32 KiB，写回中转区共 4 KiB |
+| Block tile | `BM=128, BN=128, BK=16` | 一个 block 负责 C 的 `128×128` 区域 |
+| Warp tile | `WM=64, WN=64` | 4 个 warp 按 `2×2` 排列，每个计算 `64×64` |
+| WMMA | `16×16×8` | 每个 warp 保存 `4×4` 个累加 fragment |
+| Shared memory | 48 KiB/block | 三阶段 A/B 流水；完成计算后复用为尾块写回区 |
 
-例如 warp 0 负责 C 的左上 `32×32`，warp 1 负责右上，warp 2 负责左下，warp 3 负责右下。warp 内的 32 个线程共同完成一次 `mma_sync`。每次 K 前进 8，加载两个 A fragment、两个 B fragment，组合成四次 MMA，实现 fragment 复用。
+例如 warp 0 负责 C 的左上 `64×64`，warp 1 负责右上，warp 2 负责左下，warp 3 负责右下。warp 内的 32 个线程共同完成 `mma_sync`，同一 A/B fragment 会在更多输出 fragment 间复用。
 
-双缓冲执行顺序：
+默认三阶段流水执行顺序：
 
 ```text
-预取 tile 0 -> buffer 0，等待并同步 block
-预取 tile 1 -> buffer 1，同时计算 buffer 0
-等待并同步 block，切换 read buffer
-预取 tile 2 -> buffer 0，同时计算 buffer 1
-等待并同步 block，切换 read buffer
+预取 tile 0/1，等待 tile 0 并同步 block
+预取 tile 2，同时计算 tile 0
+等待 tile 1 并同步 block
+预取 tile 3，同时计算 tile 1
 ……
 最后一个 tile 只计算，不发起新的预取
 ```
 
-`cp.async.wait_group 0` 等待当前线程的拷贝；随后的 `__syncthreads()` 确保整个 block 完成加载和旧 buffer 的读取。两者都需要。能否充分隐藏搬运延迟、能提升多少性能，需要在目标 GPU 上测量。
+`cp.async.wait_group 1/2` 保留后续拷贝在途；随后的 `__syncthreads()` 确保整个 block 完成所需加载并停止读取待复用 buffer。两者都需要。
 
-对齐且完整的连续四个 float 用 16 字节异步拷贝；非对齐输入行或尾部使用 4 字节拷贝，越界元素通过 `src-size=0` 补零。shared memory 按 32 字节对齐。最后先把完整 WMMA fragment 写入每个 warp 私有的 shared 中转区，再检查行列边界写 C，所以 M/N/K 不必是 tile 大小的倍数。`M=0` 或 `N=0` 不启动 kernel，`K=0` 将 C 写成 0。
+完整对齐的 tile 使用无边界分支的 16 字节异步拷贝；非对齐输入行或尾部使用 4 字节拷贝，越界元素通过 `src-size=0` 补零。完整输出 tile 由 WMMA 直接写 global memory；尾块复用输入 shared memory 作安全中转。因此 M/N/K 不必是 tile 大小的倍数。`M=0` 或 `N=0` 不启动 kernel，`K=0` 将 C 写成 0。
 
 在 NVIDIA GPU 环境，从本目录运行：
 
@@ -49,6 +48,6 @@ compute-sanitizer --tool synccheck --error-exitcode 1 /tmp/test_tensor_core_gemm
 
 可以把 `sm_80` 换成目标 GPU 的架构。测试包含精确可表示输入与 CPU double 参考值的严格比较、普通 float 输入的 TF32 误差检查、1/2/3/4 个 K tile、多轮缓冲复用、非整块尺寸、非 16 字节对齐的输入/输出、空维度、重复覆盖写，以及另一组模板参数。普通输入的容差按点积各项绝对值之和设置，避免正负抵消使相对误差失真；严格用例的容差为 0。
 
-本次开发环境为 macOS ARM，没有 nvcc/NVIDIA GPU，因此上述 GPU 编译、正确性测试、sanitizer 和性能测试尚未执行。`test_tensor_core_gemm.cu` 是独立测试入口，仓库原有 `src/run.cu` 目前为空。
+该实现已在 RTX 4060 Laptop（SM89）与 CUDA 12.6 上完成编译、正确性和性能测试。详细过程见 `../../learning-note/GEMM优化实测.md`。
 
 接口约束参考：[NVIDIA WMMA 文档](https://docs.nvidia.com/cuda/archive/12.5.0/cuda-c-programming-guide/index.html#warp-matrix-functions)；异步拷贝与同步语义参考：[NVIDIA PTX cp.async 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async)。

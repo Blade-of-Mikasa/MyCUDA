@@ -22,7 +22,7 @@ static void expect_status(cudaError_t actual, cudaError_t expected) {
     }
 }
 
-template<int BM = 64, int BN = 64, int BK = 32, int WM = 32, int WN = 32>
+template<int BM = 128, int BN = 128, int BK = 16, int WM = 64, int WN = 64>
 static void run_case(int M, int K, int N, bool exact, int offset, cudaStream_t stream) {
     const std::size_t a_size = static_cast<std::size_t>(M) * K;
     const std::size_t b_size = static_cast<std::size_t>(K) * N;
