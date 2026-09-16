@@ -46,3 +46,37 @@ wmma::load_matrix_sync(...)
 wmma::mma_sync(...)
 
 wmma::store_matrix_sync(...)
+
+## 内嵌汇编
+
+```Cpp
+asm(
+    "order %index, %index, %index;"
+    : output
+    : input
+);
+```
+
+## Bank
+
+为了同时兼顾成本（不能每个字节都一个端口）和正常访问顺序（一般是 thread_i <-> 地址 x+i ），所以分 Bank 时安排成交叉形 （Bank1, Bank2, ..., Bank32, Bank1, ...）
+
+访问一个 Bank 的不同地址时退化为串行。
+
+# 优化指标
+
+## key
+
+核心优化指标
+
+- latency
+- throughput
+
+## objective
+
+用来观察，分析和解释核心指标
+
+- Memory Bandwidth
+- Compute Utilization
+- Arithmetic Intensity
+- Roofline
